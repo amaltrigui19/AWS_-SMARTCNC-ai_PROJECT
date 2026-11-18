@@ -1,0 +1,1 @@
+# AWS_-SMARTCNC-ai_PROJECT
