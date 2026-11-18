@@ -226,3 +226,6 @@ data/*.csv
 *.pkl
 .env
 .aws/
+
+# Fichiers de rejeu générés (data/replay/test, data/replay/full)
+data/replay/
