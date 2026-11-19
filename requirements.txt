@@ -4,5 +4,6 @@ boto3>=1.34
 pytest>=8
 moto[s3,dynamodb,kinesis]>=5
 
-# scikit-learn : version à FIXER avec B (même version dans SageMaker et dans l'image Lambda de scoring)
-# scikit-learn==X.Y.Z
+# Modèle (même version dans SageMaker et dans l'image Lambda de scoring)
+scikit-learn==1.5.2
+numpy<2.1
