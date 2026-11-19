@@ -7,3 +7,6 @@ moto[s3,dynamodb,kinesis]>=5
 # Modèle (même version dans SageMaker et dans l'image Lambda de scoring)
 scikit-learn==1.5.2
 numpy<2.1
+
+# Entraînement seulement (jeu de données au format parquet), pas dans la Lambda
+pyarrow>=15
