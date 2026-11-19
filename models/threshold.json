@@ -1,0 +1,7 @@
+{
+  "threshold": 0.9480504312717839,
+  "cooldown_hours": 12,
+  "horizon_hours": 24,
+  "precision_val": 0.9575113808801214,
+  "recall_val": 0.9737654320987654
+}

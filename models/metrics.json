@@ -1,0 +1,38 @@
+{
+  "threshold": 0.9480504312717839,
+  "validation": {
+    "pr_auc": 0.9948315580011049,
+    "roc_auc": 0.999903509844515,
+    "baseline_pr_auc": 0.018620689655172412,
+    "precision": 0.9575113808801214,
+    "recall": 0.9737654320987654
+  },
+  "test_rows": {
+    "pr_auc": 0.9922417567514485,
+    "roc_auc": 0.9998520692993138,
+    "baseline_pr_auc": 0.018284424379232507,
+    "precision": 0.9510882856444118,
+    "recall": 0.9602469135802469
+  },
+  "test_alerts": {
+    "alerts": 395,
+    "alerts_per_machine_per_week": 0.29972899728997293,
+    "alert_precision": 0.8556962025316456,
+    "failures": 171,
+    "failures_detected_24h_before": 171,
+    "failure_recall": 1.0,
+    "lead_time_hours_median": 23.0,
+    "lead_time_hours_p25_p75": [
+      23.0,
+      23.0
+    ]
+  },
+  "split": {
+    "train_end": "2015-08-31 00:00:00",
+    "val": [
+      "2015-09-01 00:00:00",
+      "2015-09-30 00:00:00"
+    ],
+    "test_start": "2015-10-01 00:00:00"
+  }
+}
