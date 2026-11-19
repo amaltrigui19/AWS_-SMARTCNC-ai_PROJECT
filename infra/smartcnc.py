@@ -16,6 +16,14 @@ Commandes (python infra/smartcnc.py <commande>) :
     sim-reset         efface la position (le prochain lot repart du début du manifest)
     sim-once          invoque la Lambda une fois, tout de suite
     status            état du flux, de la règle, de la position et de stream/
+
+Semaine 2 (scoring) :
+    upload-model      envoie models/model.pkl, columns.json, threshold.json dans s3://…/models/
+    load-machines     écrit l'état initial (préchauffé) des machines du rejeu dans machine_state
+    push-scoring      construit l'image Docker de la Lambda de scoring et la pousse dans ECR
+    deploy-scoring    crée ou met à jour la Lambda de scoring (+ son déclencheur Kinesis si le flux existe)
+    risks             affiche le dernier risque de chaque machine (machine_state)
+    logs              derniers journaux CloudWatch (--name scoring|simulator, --minutes 30)
 """
 from __future__ import annotations
 
@@ -37,6 +45,9 @@ STREAM = "smartcnc-measurements"
 FIREHOSE = "smartcnc-archive"
 SIM_LAMBDA = "smartcnc-simulator"
 SIM_RULE = "smartcnc-simulator-every-minute"
+SCORING_LAMBDA = "smartcnc-scoring"
+SCORING_REPO = "smartcnc-scoring"
+MODEL_FILES = ["model.pkl", "columns.json", "threshold.json"]
 PREFIXES = ["raw/", "replay/", "stream/", "models/"]
 RAW_FILES = ["PdM_telemetry.csv", "PdM_errors.csv", "PdM_maint.csv", "PdM_failures.csv", "PdM_machines.csv"]
 
@@ -168,6 +179,7 @@ def cmd_stream_up(args):
             break
         time.sleep(5)
     print(f"Firehose : {status}")
+    _ensure_scoring_trigger(stream_arn)
 
 
 def cmd_stream_down(args):
@@ -175,6 +187,7 @@ def cmd_stream_down(args):
         cmd_sim_stop(args)
     except ClientError:
         pass
+    _delete_scoring_trigger()
     kin, fh = session.client("kinesis"), session.client("firehose")
     try:
         fh.delete_delivery_stream(DeliveryStreamName=FIREHOSE)
@@ -257,8 +270,146 @@ def cmd_sim_stop(args):
 
 
 def cmd_sim_reset(args):
+    # On arrête d'abord le simulateur : sinon un lot peut partir avant 'load-machines'.
+    session.client("events").disable_rule(Name=SIM_RULE)
+    print("Simulateur arrêté (relancer 'sim-start' après 'load-machines')")
     session.client("dynamodb").delete_item(TableName="replay_state", Key={"id": {"S": "simulator"}})
     print("Position effacée : le prochain lot repart du début du manifest")
+    print("⚠ Relancer aussi 'load-machines' : sinon la Lambda de scoring ignore les événements "
+          "plus anciens que ceux déjà traités.")
+
+
+# ------------------------------------------------------------------- Scoring
+
+def cmd_upload_model(args):
+    s3, name, src = session.client("s3"), bucket_name(), Path(args.models)
+    missing = [f for f in MODEL_FILES if not (src / f).exists()]
+    if missing:
+        sys.exit(f"Fichiers manquants dans {src} : {', '.join(missing)}")
+    for f in MODEL_FILES:
+        s3.upload_file(str(src / f), name, f"models/{f}")
+        print(f"models/{f}")
+    print("Si la Lambda de scoring tourne déjà, relancer 'deploy-scoring' pour qu'elle recharge le modèle.")
+
+
+def cmd_load_machines(args):
+    sys.path.insert(0, str(ROOT / "src" / "scoring"))
+    from init_state import initial_states
+    from state_store import batch_put_states
+
+    manifest_path = Path(args.data) / "replay" / args.replay / "manifest.json"
+    if not manifest_path.exists():
+        sys.exit(f"{manifest_path} introuvable : lancer d'abord prepare_replay.py")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    machines = None if manifest["machines"] == "all" else manifest["machines"]
+    print(f"Préchauffage des états au {manifest['start']} (lecture des CSV, ~30 s)…")
+    states = initial_states(Path(args.data), manifest["start"], machines)
+    batch_put_states(session.client("dynamodb"), "machine_state", states)
+    print(f"{len(states)} machines écrites dans machine_state (rejeu '{args.replay}')")
+
+
+def _ecr_login(ecr) -> str:
+    import base64
+    import subprocess
+    auth = ecr.get_authorization_token()["authorizationData"][0]
+    user, password = base64.b64decode(auth["authorizationToken"]).decode().split(":", 1)
+    registry = auth["proxyEndpoint"].replace("https://", "")
+    subprocess.run(["docker", "login", "--username", user, "--password-stdin", registry],
+                   input=password.encode(), check=True)
+    return registry
+
+
+def cmd_push_scoring(args):
+    import subprocess
+    ecr = session.client("ecr")
+    try:
+        ecr.create_repository(repositoryName=SCORING_REPO)
+        print(f"Dépôt ECR créé : {SCORING_REPO}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "RepositoryAlreadyExistsException":
+            raise
+    registry = _ecr_login(ecr)
+    uri = f"{registry}/{SCORING_REPO}:latest"
+    # --provenance=false : sinon Docker produit un index d'images que Lambda refuse.
+    subprocess.run(["docker", "build", "--platform", "linux/amd64", "--provenance=false",
+                    "-f", "src/scoring/Dockerfile", "-t", uri, "."], cwd=ROOT, check=True)
+    subprocess.run(["docker", "push", uri], check=True)
+    print(f"Image poussée : {uri}")
+
+
+def _scoring_image_uri() -> str:
+    repo = session.client("ecr").describe_repositories(repositoryNames=[SCORING_REPO])["repositories"][0]
+    return repo["repositoryUri"] + ":latest"
+
+
+def cmd_deploy_scoring(args):
+    lam = session.client("lambda")
+    image = _scoring_image_uri()
+    env = {"Variables": {"BUCKET": bucket_name(), "MODEL_PREFIX": "models/", "STATE_TABLE": "machine_state"}}
+    try:
+        lam.create_function(
+            FunctionName=SCORING_LAMBDA, PackageType="Image", Code={"ImageUri": image},
+            Role=lab_role_arn(), Timeout=120, MemorySize=1024, Environment=env,
+        )
+        print(f"Lambda créée : {SCORING_LAMBDA}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceConflictException":
+            raise
+        lam.update_function_code(FunctionName=SCORING_LAMBDA, ImageUri=image)
+        lam.get_waiter("function_updated_v2").wait(FunctionName=SCORING_LAMBDA)
+        lam.update_function_configuration(FunctionName=SCORING_LAMBDA, Environment=env,
+                                          Timeout=120, MemorySize=1024)
+        print(f"Lambda mise à jour : {SCORING_LAMBDA} (nouveau conteneur : le modèle sera rechargé)")
+    lam.get_waiter("function_active_v2").wait(FunctionName=SCORING_LAMBDA)
+    try:
+        arn = session.client("kinesis").describe_stream_summary(StreamName=STREAM)["StreamDescriptionSummary"]["StreamARN"]
+        _ensure_scoring_trigger(arn)
+    except ClientError:
+        print("Kinesis absent : le déclencheur sera créé par 'stream-up'")
+
+
+def _ensure_scoring_trigger(stream_arn: str) -> None:
+    """Relie Kinesis à la Lambda de scoring (si elle existe)."""
+    lam = session.client("lambda")
+    try:
+        lam.get_function(FunctionName=SCORING_LAMBDA)
+    except ClientError:
+        return  # pas encore déployée (semaine 1)
+    existing = lam.list_event_source_mappings(FunctionName=SCORING_LAMBDA, EventSourceArn=stream_arn)
+    if existing["EventSourceMappings"]:
+        print("Déclencheur Kinesis -> scoring : déjà présent")
+        return
+    lam.create_event_source_mapping(
+        FunctionName=SCORING_LAMBDA, EventSourceArn=stream_arn,
+        StartingPosition="TRIM_HORIZON",       # rien n'est perdu si le simulateur a démarré avant
+        BatchSize=1000, MaximumBatchingWindowInSeconds=5,
+        MaximumRetryAttempts=2, BisectBatchOnFunctionError=True,
+    )
+    print("Déclencheur Kinesis -> scoring : créé")
+
+
+def _delete_scoring_trigger() -> None:
+    lam = session.client("lambda")
+    try:
+        mappings = lam.list_event_source_mappings(FunctionName=SCORING_LAMBDA)["EventSourceMappings"]
+    except ClientError:
+        return
+    for m in mappings:
+        lam.delete_event_source_mapping(UUID=m["UUID"])
+        print("Déclencheur Kinesis -> scoring : supprimé")
+
+
+def cmd_risks(args):
+    sys.path.insert(0, str(ROOT / "src" / "scoring"))
+    from state_store import from_item
+    pages = session.client("dynamodb").get_paginator("scan").paginate(TableName="machine_state")
+    states = sorted((from_item(i) for p in pages for i in p["Items"]), key=lambda s: s["machineID"])
+    print(f"{'machine':>7}  {'dernier événement':<19}  {'dernier risque à':<19}  risque")
+    for s in states:
+        risk = s.get("risk")
+        print(f"{s['machineID']:>7}  {str(s.get('last_datetime') or '-'):<19}  "
+              f"{str(s.get('risk_datetime') or '-'):<19}  {'-' if risk is None else f'{risk:.3f}'}")
+    print(f"{len(states)} machines")
 
 
 def cmd_sim_once(args):
@@ -312,6 +463,38 @@ def cmd_status(args):
         return " | ".join(out)
     print("Firehose (30 min) :", safe(firehose_metrics))
 
+    def scoring_trigger():
+        lam = session.client("lambda")
+        lam.get_function(FunctionName=SCORING_LAMBDA)
+        maps = lam.list_event_source_mappings(FunctionName=SCORING_LAMBDA)["EventSourceMappings"]
+        if not maps:
+            return "Lambda déployée, mais AUCUN déclencheur Kinesis (lancer stream-up ou deploy-scoring)"
+        return " | ".join(f"{m['State']}, dernier traitement : {m.get('LastProcessingResult', '?')}" for m in maps)
+    print("Scoring  :", safe(scoring_trigger))
+
+
+def cmd_logs(args):
+    """Derniers messages CloudWatch d'une Lambda (erreurs comprises)."""
+    fn = {"scoring": SCORING_LAMBDA, "simulator": SIM_LAMBDA}[args.name]
+    logs = session.client("logs")
+    start = int((time.time() - args.minutes * 60) * 1000)
+    try:
+        pages = logs.get_paginator("filter_log_events").paginate(
+            logGroupName=f"/aws/lambda/{fn}", startTime=start)
+        events = [e for p in pages for e in p["events"]]
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ResourceNotFoundException":
+            sys.exit(f"Aucun journal pour {fn} : la Lambda n'a jamais été appelée.")
+        raise
+    if not events:
+        print(f"Aucun message de {fn} dans les {args.minutes} dernières minutes : elle n'a pas été appelée.")
+        return
+    for e in events[-args.lines:]:
+        stamp = time.strftime("%H:%M:%S", time.localtime(e["timestamp"] / 1000))
+        print(stamp, e["message"].rstrip())
+    errors = [e for e in events if any(w in e["message"] for w in ("Error", "Traceback", "Task timed out", "ERROR"))]
+    print(f"\n{len(events)} messages, dont {len(errors)} contenant une erreur ({args.minutes} min).")
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -327,8 +510,17 @@ def main():
     dep = sub.add_parser("deploy-simulator")
     dep.add_argument("--replay", default="test", help="sous-dossier de replay/ (test ou full)")
     dep.add_argument("--hours", type=int, default=60, help="heures simulées par lot")
-    for c in ["sim-start", "sim-stop", "sim-reset", "sim-once", "status"]:
+    for c in ["sim-start", "sim-stop", "sim-reset", "sim-once", "status",
+              "push-scoring", "deploy-scoring", "risks"]:
         sub.add_parser(c)
+    sub.add_parser("upload-model").add_argument("--models", default=str(ROOT / "models"))
+    lg = sub.add_parser("logs")
+    lg.add_argument("--name", choices=["scoring", "simulator"], default="scoring")
+    lg.add_argument("--minutes", type=int, default=30)
+    lg.add_argument("--lines", type=int, default=40)
+    lm = sub.add_parser("load-machines")
+    lm.add_argument("--replay", default="test", help="rejeu dont on lit le manifest (test ou full)")
+    lm.add_argument("--data", default=str(ROOT / "data"))
     args = p.parse_args()
     globals()["cmd_" + args.cmd.replace("-", "_")](args)
 
