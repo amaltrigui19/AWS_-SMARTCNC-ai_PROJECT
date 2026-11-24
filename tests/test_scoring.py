@@ -251,6 +251,84 @@ def test_lambda_rejects_mismatched_columns(aws):
         scoring.lambda_handler({"Records": [_kinesis(ev)]}, None)
 
 
+# ------------------------------------------------------ semaine 3 : alertes, archive
+
+def _scored(mid, hours_and_risks):
+    return [{"machineID": mid, "datetime": f"2015-10-01 {h:02d}:00:00", "risk": r, "features": [0.0] * 30}
+            for h, r in hours_and_risks]
+
+
+def test_cooldown_12h():
+    states = {1: {"last_alert": None}}
+    scored = _scored(1, [(0, 0.99), (1, 0.99), (11, 0.99), (12, 0.99), (13, 0.10), (23, 0.99)])
+    alerts = scoring.decide_alerts(states, scored, threshold=0.948, cooldown_hours=12)
+    assert [a["datetime"][11:13] for a in alerts] == ["00", "12"]   # 01h et 11h : < 12 h ; 23h : 11 h après 12h
+    assert states[1]["last_alert"] == "2015-10-01 12:00:00"
+    assert [s["alert"] for s in scored] == [True, False, False, True, False, False]
+
+
+def test_cooldown_continues_from_previous_batch():
+    states = {1: {"last_alert": "2015-09-30 20:00:00"}}
+    alerts = scoring.decide_alerts(states, _scored(1, [(5, 0.99), (8, 0.99)]), 0.948, 12)
+    assert [a["datetime"] for a in alerts] == ["2015-10-01 08:00:00"]
+
+
+class FailingLambda:
+    def __init__(self):
+        self.calls = 0
+
+    def invoke(self, **kw):
+        self.calls += 1
+        raise RuntimeError("Function not found")
+
+
+def test_agent_failure_restores_last_alert(monkeypatch):
+    monkeypatch.setenv("AGENT_FUNCTION", "smartcnc-agent")
+    fake = FailingLambda()
+    monkeypatch.setitem(scoring._clients, "lambda", fake)
+    states = {1: {"last_alert": "2015-09-30 00:00:00", "run_id": "r1"}}
+    alerts = scoring.decide_alerts(states, _scored(1, [(5, 0.99)]), 0.948, 12)
+    assert scoring.notify_agent(states, alerts, 0.948) == 0
+    assert fake.calls == 1
+    assert states[1]["last_alert"] == "2015-09-30 00:00:00" and alerts[0]["alert"] is False
+
+
+def test_agent_payload_has_named_features():
+    a = _scored(3, [(11, 0.999)])[0]
+    p = scoring.agent_payload(a, 0.948, "r1")
+    assert p["machineID"] == 3 and p["run_id"] == "r1" and list(p["features"]) == features.FEATURE_COLUMNS
+    json.dumps(p)
+
+
+def test_emit_metrics_is_valid_emf(capsys):
+    scored = _scored(1, [(0, 0.2), (1, 0.99)]) + _scored(2, [(0, 0.5)])
+    scoring.emit_metrics(5, scored, 0.948, [scored[1]], {1: {"run_id": "r1"}, 2: {}})
+    lines = [json.loads(l) for l in capsys.readouterr().out.splitlines()]
+    emf = lines[0]
+    assert emf["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "SmartCNC"
+    assert emf["AboveThreshold"] == 1 and emf["Alerts"] == 1 and emf["MaxRisk"] == 0.99
+    latest = {l["machineID"]: l for l in lines if l["kind"] == "machine_risk"}
+    assert latest[1]["datetime"] == "2015-10-01 01:00:00" and set(latest) == {1, 2}
+    assert [l["machineID"] for l in lines if l["kind"] == "alert"] == [1]
+
+
+def test_lambda_archives_risks_and_alerts(aws, data_dir, capsys):
+    replay = [e for e in all_events(data_dir) if e["datetime"] >= START]
+    r = scoring.lambda_handler({"Records": [_kinesis(e) for e in replay]}, None)
+    # Machine 1 : risque haut de 00h à 05h le 01/10 -> une seule alerte (règle des 12 h).
+    assert r["alerts"] == 1 and r["agent_calls"] == 0   # pas d'AGENT_FUNCTION : journalisée seulement
+
+    objs = boto3.client("s3").list_objects_v2(Bucket="smartcnc-test", Prefix="stream/risks/")["Contents"]
+    assert len(objs) == 1 and objs[0]["Key"].startswith("stream/risks/run=sans-run/2015-10-01/")
+    body = boto3.client("s3").get_object(Bucket="smartcnc-test", Key=objs[0]["Key"])["Body"].read().decode()
+    rows = [json.loads(l) for l in body.splitlines()]
+    assert len(rows) == r["scored"] == 96
+    assert sum(x["alert"] for x in rows) == 1 and sum(x["above"] for x in rows) == r["above_threshold"]
+
+    state = batch_get_states(aws, "machine_state", [1])[1]
+    assert state["last_alert"] == "2015-10-01 00:00:00"
+
+
 # ------------------------------------------------------------- vrai modèle de B
 
 MODEL = ROOT / "models" / "model.pkl"

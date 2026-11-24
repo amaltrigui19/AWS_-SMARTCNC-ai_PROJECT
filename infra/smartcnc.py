@@ -24,6 +24,12 @@ Semaine 2 (scoring) :
     deploy-scoring    crée ou met à jour la Lambda de scoring (+ son déclencheur Kinesis si le flux existe)
     risks             affiche le dernier risque de chaque machine (machine_state)
     logs              derniers journaux CloudWatch (--name scoring|simulator, --minutes 30)
+
+Semaine 3 (historique et tableau de bord) :
+    athena-setup      crée la base smartcnc : tables events, risks, tickets, failures + vues d'analyse
+    athena-report     alertes du dernier rejeu comparées aux pannes réelles (délai d'anticipation)
+    athena-check      diagnostic si athena-report est vide (Lambda, S3, tables)
+    dashboard         crée ou met à jour le tableau de bord CloudWatch « SmartCNC »
 """
 from __future__ import annotations
 
@@ -48,6 +54,9 @@ SIM_RULE = "smartcnc-simulator-every-minute"
 SCORING_LAMBDA = "smartcnc-scoring"
 SCORING_REPO = "smartcnc-scoring"
 MODEL_FILES = ["model.pkl", "columns.json", "threshold.json"]
+AGENT_LAMBDA = "smartcnc-agent"          # Lambda de B (contrat 4)
+ATHENA_DB = "smartcnc"
+DASHBOARD = "SmartCNC"
 PREFIXES = ["raw/", "replay/", "stream/", "models/"]
 RAW_FILES = ["PdM_telemetry.csv", "PdM_errors.csv", "PdM_maint.csv", "PdM_failures.csv", "PdM_machines.csv"]
 
@@ -304,8 +313,12 @@ def cmd_load_machines(args):
     machines = None if manifest["machines"] == "all" else manifest["machines"]
     print(f"Préchauffage des états au {manifest['start']} (lecture des CSV, ~30 s)…")
     states = initial_states(Path(args.data), manifest["start"], machines)
+    # run_id identifie ce rejeu dans les archives (Athena compare les alertes d'un même rejeu aux pannes).
+    run_id = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    for s in states:
+        s["run_id"] = run_id
     batch_put_states(session.client("dynamodb"), "machine_state", states)
-    print(f"{len(states)} machines écrites dans machine_state (rejeu '{args.replay}')")
+    print(f"{len(states)} machines écrites dans machine_state (rejeu '{args.replay}', run_id {run_id})")
 
 
 def _ecr_login(ecr) -> str:
@@ -345,7 +358,16 @@ def _scoring_image_uri() -> str:
 def cmd_deploy_scoring(args):
     lam = session.client("lambda")
     image = _scoring_image_uri()
-    env = {"Variables": {"BUCKET": bucket_name(), "MODEL_PREFIX": "models/", "STATE_TABLE": "machine_state"}}
+    # L'agent (B) n'est appelé que s'il est déjà déployé ; sinon les alertes sont seulement journalisées.
+    try:
+        lam.get_function(FunctionName=AGENT_LAMBDA)
+        agent = AGENT_LAMBDA
+        print(f"Agent trouvé : {AGENT_LAMBDA} (appelé à chaque alerte)")
+    except ClientError:
+        agent = ""
+        print(f"Agent {AGENT_LAMBDA} absent : alertes journalisées seulement (relancer deploy-scoring après B)")
+    env = {"Variables": {"BUCKET": bucket_name(), "MODEL_PREFIX": "models/", "STATE_TABLE": "machine_state",
+                         "ARCHIVE_PREFIX": "stream/risks/", "AGENT_FUNCTION": agent}}
     try:
         lam.create_function(
             FunctionName=SCORING_LAMBDA, PackageType="Image", Code={"ImageUri": image},
@@ -496,6 +518,205 @@ def cmd_logs(args):
     print(f"\n{len(events)} messages, dont {len(errors)} contenant une erreur ({args.minutes} min).")
 
 
+# -------------------------------------------------------------------- Athena
+
+DT = "'%Y-%m-%d %H:%i:%s'"   # format des dates (contrat 1) pour date_parse / date_format
+
+
+def athena_ddl(bucket: str) -> list[str]:
+    json_serde = ("ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe' "
+                  "WITH SERDEPROPERTIES ('ignore.malformed.json'='true')")
+    db = ATHENA_DB
+    return [
+        f"CREATE DATABASE IF NOT EXISTS {db}",
+        # Événements rejoués (Firehose).
+        f"""CREATE EXTERNAL TABLE IF NOT EXISTS {db}.events (
+              type string, machineid int, `datetime` string, volt double, rotate double,
+              pressure double, vibration double, errorid string, comp string)
+            {json_serde} LOCATION 's3://{bucket}/stream/events/'""",
+        # Risques archivés par la Lambda de scoring (contrat 4).
+        f"""CREATE EXTERNAL TABLE IF NOT EXISTS {db}.risks (
+              run_id string, machineid int, `datetime` string, risk double,
+              threshold double, above boolean, alert boolean)
+            {json_serde} LOCATION 's3://{bucket}/stream/risks/'""",
+        # Tickets archivés par l'agent de B (contrats 3 et 4).
+        f"""CREATE EXTERNAL TABLE IF NOT EXISTS {db}.tickets (
+              ticketid string, machineid int, created_at string, risk double, suspected_comp string,
+              recommendation string, status string, run_id string)
+            {json_serde} LOCATION 's3://{bucket}/stream/tickets/'""",
+        # Vérité terrain : jamais rejouée, seulement lue ici (copie de raw/PdM_failures.csv).
+        f"""CREATE EXTERNAL TABLE IF NOT EXISTS {db}.failures (
+              `datetime` string, machineid string, failure string)
+            ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+            LOCATION 's3://{bucket}/reference/failures/'
+            TBLPROPERTIES ('skip.header.line.count'='1')""",
+        # Risques du dernier rejeu seulement.
+        f"""CREATE OR REPLACE VIEW {db}.risks_last_run AS
+            SELECT * FROM {db}.risks
+            WHERE run_id = (SELECT max(run_id) FROM {db}.risks WHERE run_id <> 'sans-run')""",
+        # Pour chaque panne réelle de la période rejouée : premier risque élevé et première alerte
+        # dans les 24 h qui précèdent, et l'avance en heures.
+        f"""CREATE OR REPLACE VIEW {db}.failure_lead_time AS
+            WITH r AS (SELECT * FROM {db}.risks_last_run),
+            f AS (
+              SELECT DISTINCT CAST(machineid AS int) AS machineid, "datetime" AS panne, failure
+              FROM {db}.failures
+              WHERE "datetime" >= (SELECT min("datetime") FROM r)
+                AND "datetime" <= (SELECT max("datetime") FROM r)
+                AND CAST(machineid AS int) IN (SELECT DISTINCT machineid FROM r))
+            SELECT f.machineid, f.panne, f.failure,
+                   min(CASE WHEN r.above THEN r."datetime" END) AS premier_risque_eleve,
+                   min(CASE WHEN r.alert THEN r."datetime" END) AS premiere_alerte,
+                   date_diff('hour', date_parse(min(CASE WHEN r.above THEN r."datetime" END), {DT}),
+                             date_parse(f.panne, {DT})) AS avance_h
+            FROM f LEFT JOIN r
+              ON r.machineid = f.machineid
+             AND r."datetime" < f.panne
+             AND r."datetime" >= date_format(date_parse(f.panne, {DT}) - INTERVAL '24' HOUR, {DT})
+            GROUP BY f.machineid, f.panne, f.failure""",
+        # Pour chaque alerte du dernier rejeu : y a-t-il eu une vraie panne dans les 24 h suivantes ?
+        f"""CREATE OR REPLACE VIEW {db}.alert_quality AS
+            SELECT r.machineid, r."datetime" AS alerte, r.risk,
+                   min(f."datetime") AS panne_suivante, min(f."datetime") IS NOT NULL AS juste
+            FROM {db}.risks_last_run r LEFT JOIN {db}.failures f
+              ON CAST(f.machineid AS int) = r.machineid
+             AND f."datetime" > r."datetime"
+             AND f."datetime" <= date_format(date_parse(r."datetime", {DT}) + INTERVAL '24' HOUR, {DT})
+            WHERE r.alert
+            GROUP BY r.machineid, r."datetime", r.risk""",
+    ]
+
+
+def athena_run(sql: str, fetch: bool = False):
+    ath = session.client("athena")
+    qid = ath.start_query_execution(
+        QueryString=sql,
+        ResultConfiguration={"OutputLocation": f"s3://{bucket_name()}/athena-results/"},
+    )["QueryExecutionId"]
+    while True:
+        st = ath.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
+        if st["State"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(1)
+    if st["State"] != "SUCCEEDED":
+        raise RuntimeError(f"Requête Athena {st['State']} : {st.get('StateChangeReason')}\n{sql}")
+    if not fetch:
+        return None
+    rows = []
+    for page in ath.get_paginator("get_query_results").paginate(QueryExecutionId=qid):
+        rows += [[c.get("VarCharValue", "") for c in r["Data"]] for r in page["ResultSet"]["Rows"]]
+    return rows   # première ligne = noms des colonnes
+
+
+def _print_table(rows) -> None:
+    if not rows:
+        print("(aucun résultat)")
+        return
+    widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
+    for n, r in enumerate(rows):
+        print("  ".join(str(v).ljust(w) for v, w in zip(r, widths)))
+        if n == 0:
+            print("  ".join("-" * w for w in widths))
+
+
+def cmd_athena_setup(args):
+    s3, name = session.client("s3"), bucket_name()
+    s3.copy_object(Bucket=name, Key="reference/failures/PdM_failures.csv",
+                   CopySource={"Bucket": name, "Key": "raw/PdM_failures.csv"})
+    print("Pannes copiées dans reference/failures/ (vérité terrain pour Athena)")
+    for sql in athena_ddl(name):
+        athena_run(sql)
+        print("OK :", " ".join(sql.split())[:70], "…")
+    print(f"Base Athena '{ATHENA_DB}' prête (console Athena > éditeur de requêtes).")
+
+
+def cmd_athena_report(args):
+    db = ATHENA_DB
+    print("== Pannes réelles du dernier rejeu : ont-elles été annoncées ? ==")
+    _print_table(athena_run(f"SELECT * FROM {db}.failure_lead_time ORDER BY panne", fetch=True))
+    print("\n== Résumé ==")
+    _print_table(athena_run(f"""
+        SELECT count(*) AS pannes,
+               count(premier_risque_eleve) AS annoncees_24h_avant,
+               approx_percentile(avance_h, 0.5) AS avance_mediane_h,
+               (SELECT count(*) FROM {db}.alert_quality) AS alertes,
+               (SELECT count_if(juste) FROM {db}.alert_quality) AS alertes_justes
+        FROM {db}.failure_lead_time""", fetch=True))
+
+
+def cmd_athena_check(args):
+    """Diagnostic : où s'arrêtent les données entre la Lambda de scoring et Athena ?"""
+    db, name = ATHENA_DB, bucket_name()
+    env = session.client("lambda").get_function_configuration(FunctionName=SCORING_LAMBDA)["Environment"]["Variables"]
+    print("1. Lambda de scoring : ARCHIVE_PREFIX =", repr(env.get("ARCHIVE_PREFIX")),
+          "(absent = ancienne version : relancer push-scoring puis deploy-scoring)")
+    try:
+        deployed = session.client("lambda").get_function(FunctionName=SCORING_LAMBDA)["Code"].get("ResolvedImageUri", "")
+        latest = session.client("ecr").describe_images(
+            repositoryName=SCORING_REPO, imageIds=[{"imageTag": "latest"}])["imageDetails"][0]
+        same = deployed.endswith(latest["imageDigest"])
+        print(f"   Image : poussée le {latest['imagePushedAt']:%Y-%m-%d %H:%M} ;",
+              "la Lambda l'utilise ✓" if same else
+              "la Lambda utilise une AUTRE image ✗ (relancer deploy-scoring)")
+    except ClientError as e:
+        print("   Image : vérification impossible", e.response["Error"]["Code"])
+    pages = session.client("s3").get_paginator("list_objects_v2").paginate(Bucket=name, Prefix="stream/risks/")
+    keys = [o["Key"] for p in pages for o in p.get("Contents", [])]
+    runs = sorted({k.split("/")[2] for k in keys if k.count("/") >= 3})
+    print(f"2. S3 stream/risks/ : {len(keys)} fichiers, rejeux : {', '.join(runs) or 'aucun'}")
+    print("3. Athena, table risks :")
+    _print_table(athena_run(f"""SELECT run_id, count(*) AS lignes, min("datetime") AS debut, max("datetime") AS fin,
+                                       count_if(above) AS risques_eleves, count_if(alert) AS alertes
+                                FROM {db}.risks GROUP BY run_id ORDER BY run_id""", fetch=True))
+    print("4. Athena, table failures (vérité terrain) :")
+    _print_table(athena_run(f"""SELECT count(*) AS pannes, min("datetime") AS premiere, max("datetime") AS derniere
+                                FROM {db}.failures""", fetch=True))
+
+
+# ----------------------------------------------------------- Tableau de bord
+
+def dashboard_body() -> dict:
+    def metric(title, metrics, stat="Sum", x=0, y=0, w=12, h=6, view="timeSeries"):
+        return {"type": "metric", "x": x, "y": y, "width": w, "height": h, "properties": {
+            "title": title, "region": REGION, "view": view, "stat": stat, "period": 60, "metrics": metrics}}
+
+    def logs(title, query, x=0, y=0, w=12, h=8):
+        return {"type": "log", "x": x, "y": y, "width": w, "height": h, "properties": {
+            "title": title, "region": REGION, "view": "table",
+            "query": f"SOURCE '/aws/lambda/{SCORING_LAMBDA}' | {query}"}}
+
+    return {"widgets": [
+        {"type": "text", "x": 0, "y": 0, "width": 24, "height": 2, "properties": {"markdown":
+            "# SmartCNC AI — maintenance prédictive\nRejeu Azure PdM · risque de panne dans les 24 h · "
+            "alerte si risque ≥ seuil (au plus une par machine toutes les 12 h simulées)"}},
+        metric("Alertes et risques élevés (par minute)",
+               [["SmartCNC", "Alerts"], ["SmartCNC", "AboveThreshold"]], x=0, y=2),
+        metric("Risque maximal du lot", [["SmartCNC", "MaxRisk"]], stat="Maximum", x=12, y=2),
+        logs("Dernier risque de chaque machine",
+             "filter kind = 'machine_risk' | stats latest(risk) as risque, latest(`datetime`) as heure_simulee "
+             "by machineID | sort risque desc | limit 100", x=0, y=8),
+        logs("Dernières alertes",
+             "filter kind = 'alert' | fields `datetime` as heure_simulee, machineID, risk, agent "
+             "| sort @timestamp desc | limit 20", x=12, y=8),
+        metric("Événements traités / risques calculés",
+               [["SmartCNC", "EventsProcessed"], ["SmartCNC", "RisksComputed"]], x=0, y=16, w=8),
+        metric("Retard de lecture Kinesis (ms)",
+               [["AWS/Kinesis", "GetRecords.IteratorAgeMilliseconds", "StreamName", STREAM]],
+               stat="Maximum", x=8, y=16, w=8),
+        metric("Erreurs des Lambdas",
+               [["AWS/Lambda", "Errors", "FunctionName", SCORING_LAMBDA],
+                ["AWS/Lambda", "Errors", "FunctionName", SIM_LAMBDA],
+                ["AWS/Lambda", "Errors", "FunctionName", AGENT_LAMBDA]], x=16, y=16, w=8),
+    ]}
+
+
+def cmd_dashboard(args):
+    session.client("cloudwatch").put_dashboard(DashboardName=DASHBOARD,
+                                               DashboardBody=json.dumps(dashboard_body()))
+    print(f"Tableau de bord prêt : https://{REGION}.console.aws.amazon.com/cloudwatch/home"
+          f"?region={REGION}#dashboards/dashboard/{DASHBOARD}")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -511,7 +732,7 @@ def main():
     dep.add_argument("--replay", default="test", help="sous-dossier de replay/ (test ou full)")
     dep.add_argument("--hours", type=int, default=60, help="heures simulées par lot")
     for c in ["sim-start", "sim-stop", "sim-reset", "sim-once", "status",
-              "push-scoring", "deploy-scoring", "risks"]:
+              "push-scoring", "deploy-scoring", "risks", "athena-setup", "athena-report", "athena-check", "dashboard"]:
         sub.add_parser(c)
     sub.add_parser("upload-model").add_argument("--models", default=str(ROOT / "models"))
     lg = sub.add_parser("logs")

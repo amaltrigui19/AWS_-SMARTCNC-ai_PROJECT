@@ -110,3 +110,39 @@ Docker Desktop doit être lancé.
 - **Sécurité** : la Lambda refuse de démarrer si `columns.json` ne correspond pas à `FEATURE_COLUMNS`.
 - **Un seul appel au modèle par lot**, et une seule écriture par machine et par lot (coût DynamoDB).
 - **Déclencheur Kinesis** : lots de 1 000 au plus, 2 nouvelles tentatives, découpage du lot en cas d'erreur. Il est créé par `stream-up` et supprimé par `stream-down`, avec le flux.
+
+## Partie A — semaine 3 : historique, alertes, tableau de bord
+
+Le partage du travail avec l'agent de B est décrit dans le [contrat 4](contracts/agent.md).
+
+```
+Lambda de scoring ──► règle des 12 h ──► Lambda agent (B) : Bedrock, ticket, SNS
+        │
+        ├──► S3 stream/risks/run=<run_id>/ ──► Athena (risks, events, tickets, failures)
+        └──► journaux JSON (EMF) ──► tableau de bord CloudWatch « SmartCNC »
+```
+
+| Ajout | Rôle |
+|---|---|
+| Règle des 12 h dans la Lambda de scoring | Elle seule écrit `machine_state` (`last_alert` y est donc fiable), en heures simulées |
+| Appel de l'agent | Asynchrone, seulement si `smartcnc-agent` existe au moment de `deploy-scoring` |
+| Archive `stream/risks/` | Un fichier JSONL par lot ; `run_id` (fixé par `load-machines`) sépare les rejeux |
+| Athena | Tables `events`, `risks`, `tickets`, `failures` + vues `failure_lead_time` et `alert_quality` |
+| Tableau de bord CloudWatch | Alertes, risque max, dernier risque par machine, dernières alertes, retard Kinesis, erreurs Lambda |
+
+Pourquoi CloudWatch et pas QuickSight : CloudWatch est sûr d'être disponible dans le Lab et coûte presque rien ; l'offre QuickSight est devenue « Amazon Quick », avec un risque de frais mensuels importants.
+
+### Une fois (après modification du code)
+
+```powershell
+.venv\Scripts\python infra/smartcnc.py push-scoring
+.venv\Scripts\python infra/smartcnc.py deploy-scoring     # à relancer quand B aura déployé smartcnc-agent
+.venv\Scripts\python infra/smartcnc.py athena-setup
+.venv\Scripts\python infra/smartcnc.py dashboard
+```
+
+### Après un rejeu
+
+```powershell
+.venv\Scripts\python infra/smartcnc.py athena-report      # pannes réelles annoncées ? avec combien d'heures d'avance ?
+```
