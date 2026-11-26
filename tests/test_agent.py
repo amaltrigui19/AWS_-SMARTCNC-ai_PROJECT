@@ -7,8 +7,15 @@ import boto3
 import pytest
 from moto import mock_aws
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "agent"))
-import handler  # noqa: E402
+import importlib.util  # noqa: E402
+
+_AGENT = Path(__file__).resolve().parents[1] / "src" / "agent"
+sys.path.insert(0, str(_AGENT))
+# Trois modules s'appellent handler.py (simulateur, scoring, agent) : chargé sous un nom à lui
+# pour ne pas être confondu avec celui du simulateur dans test_simulator.py.
+_spec = importlib.util.spec_from_file_location("agent_handler", _AGENT / "handler.py")
+handler = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(handler)
 
 EVENT = {
     "machineID": 3, "datetime": "2015-10-03 07:00:00", "risk": 0.9993, "threshold": 0.948,

@@ -30,6 +30,14 @@ Semaine 3 (historique et tableau de bord) :
     athena-report     alertes du dernier rejeu comparées aux pannes réelles (délai d'anticipation)
     athena-check      diagnostic si athena-report est vide (Lambda, S3, tables)
     dashboard         crée ou met à jour le tableau de bord CloudWatch « SmartCNC »
+
+Semaine 4 (agent, fiabilité, coûts) :
+    alerts-topic      crée le sujet SNS smartcnc-alerts et abonne des e-mails (--email a@b --email c@d)
+    deploy-agent      déploie la Lambda agent de B (src/agent/, clé d'API lue dans .env)
+    agent-test        appelle l'agent une fois (--machine 3) pour vérifier ticket + e-mail
+    reliability       DLQ (SQS), nouvelles tentatives limitées, 6 alarmes CloudWatch -> e-mail
+    alarms            état des alarmes
+    cleanup           supprime anciennes images ECR, résultats Athena, erreurs Firehose (--old-runs : anciens rejeux)
 """
 from __future__ import annotations
 
@@ -57,6 +65,10 @@ MODEL_FILES = ["model.pkl", "columns.json", "threshold.json"]
 AGENT_LAMBDA = "smartcnc-agent"          # Lambda de B (contrat 4)
 ATHENA_DB = "smartcnc"
 DASHBOARD = "SmartCNC"
+TOPIC = "smartcnc-alerts"                # e-mails d'alerte (agent) et alarmes CloudWatch
+SCORING_DLQ = "smartcnc-scoring-dlq"     # lots Kinesis abandonnés après 2 tentatives
+AGENT_DLQ = "smartcnc-agent-dlq"         # alertes que l'agent n'a pas pu traiter
+AGENT_ENV_KEYS = ["LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL", "LLM_REASONING_EFFORT", "MODEL_ID"]
 PREFIXES = ["raw/", "replay/", "stream/", "models/"]
 RAW_FILES = ["PdM_telemetry.csv", "PdM_errors.csv", "PdM_maint.csv", "PdM_failures.csv", "PdM_machines.csv"]
 
@@ -401,13 +413,17 @@ def _ensure_scoring_trigger(stream_arn: str) -> None:
     if existing["EventSourceMappings"]:
         print("Déclencheur Kinesis -> scoring : déjà présent")
         return
+    extra = {}
+    dlq = _queue_arn(SCORING_DLQ)   # semaine 4 : si la DLQ existe, les lots abandonnés y sont décrits
+    if dlq:
+        extra["DestinationConfig"] = {"OnFailure": {"Destination": dlq}}
     lam.create_event_source_mapping(
         FunctionName=SCORING_LAMBDA, EventSourceArn=stream_arn,
         StartingPosition="TRIM_HORIZON",       # rien n'est perdu si le simulateur a démarré avant
         BatchSize=1000, MaximumBatchingWindowInSeconds=5,
-        MaximumRetryAttempts=2, BisectBatchOnFunctionError=True,
+        MaximumRetryAttempts=2, BisectBatchOnFunctionError=True, **extra,
     )
-    print("Déclencheur Kinesis -> scoring : créé")
+    print("Déclencheur Kinesis -> scoring : créé" + (" (avec DLQ)" if dlq else ""))
 
 
 def _delete_scoring_trigger() -> None:
@@ -497,7 +513,7 @@ def cmd_status(args):
 
 def cmd_logs(args):
     """Derniers messages CloudWatch d'une Lambda (erreurs comprises)."""
-    fn = {"scoring": SCORING_LAMBDA, "simulator": SIM_LAMBDA}[args.name]
+    fn = {"scoring": SCORING_LAMBDA, "simulator": SIM_LAMBDA, "agent": AGENT_LAMBDA}[args.name]
     logs = session.client("logs")
     start = int((time.time() - args.minutes * 60) * 1000)
     try:
@@ -717,6 +733,213 @@ def cmd_dashboard(args):
           f"?region={REGION}#dashboards/dashboard/{DASHBOARD}")
 
 
+# ------------------------------------------------- Semaine 4 : agent et SNS
+
+def _queue_arn(name: str, create: bool = False) -> str | None:
+    sqs = session.client("sqs")
+    try:
+        url = sqs.create_queue(QueueName=name, Attributes={"MessageRetentionPeriod": "1209600"})["QueueUrl"] \
+            if create else sqs.get_queue_url(QueueName=name)["QueueUrl"]
+    except ClientError:
+        return None
+    return sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
+
+
+def _topic_arn() -> str:
+    return session.client("sns").create_topic(Name=TOPIC)["TopicArn"]   # idempotent
+
+
+def _read_dotenv() -> dict:
+    """Lit ROOT/.env (ignoré par Git) : c'est là que vit la clé d'API du LLM, jamais dans le code."""
+    path, values = ROOT / ".env", {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                values[k.strip()] = v.strip().strip('"').strip("'")
+    return values
+
+
+def cmd_alerts_topic(args):
+    sns, arn = session.client("sns"), _topic_arn()
+    print(f"Sujet SNS : {arn}")
+    existing = {s["Endpoint"] for p in sns.get_paginator("list_subscriptions_by_topic").paginate(TopicArn=arn)
+                for s in p["Subscriptions"]}
+    for email in args.email or []:
+        if email in existing:
+            print(f"Déjà abonné : {email}")
+            continue
+        sns.subscribe(TopicArn=arn, Protocol="email", Endpoint=email)
+        print(f"Abonnement demandé : {email} -> cliquer sur « Confirm subscription » dans l'e-mail reçu")
+    for p in sns.get_paginator("list_subscriptions_by_topic").paginate(TopicArn=arn):
+        for s in p["Subscriptions"]:
+            state = "en attente de confirmation" if s["SubscriptionArn"] == "PendingConfirmation" else "confirmé"
+            print(f"  {s['Endpoint']} : {state}")
+
+
+def _zip_agent() -> bytes:
+    src = ROOT / "src" / "agent"
+    files = sorted(f for f in src.glob("*.py") if not f.name.startswith("test"))
+    if not (src / "handler.py").exists():
+        sys.exit("src/agent/handler.py introuvable : faire d'abord 'git pull' pour récupérer le code de B")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in files:
+            z.write(f, f.name)
+    return buf.getvalue()
+
+
+def cmd_deploy_agent(args):
+    lam = session.client("lambda")
+    dotenv = _read_dotenv()
+    llm = {k: dotenv.get(k, os.environ.get(k, "")) for k in AGENT_ENV_KEYS}
+    if not llm["LLM_API_KEY"]:
+        print("⚠ LLM_API_KEY absent de .env : l'agent rédigera ses diagnostics avec les règles (sans LLM)")
+    env = {"Variables": {**llm, "TOPIC_ARN": _topic_arn(), "BUCKET": bucket_name(),
+                         "TICKETS_TABLE": "tickets", "STATE_TABLE": "machine_state"}}
+    code = _zip_agent()
+    try:
+        lam.create_function(FunctionName=AGENT_LAMBDA, Runtime="python3.12", Role=lab_role_arn(),
+                            Handler="handler.lambda_handler", Code={"ZipFile": code},
+                            Timeout=30, MemorySize=256, Environment=env)
+        print(f"Lambda créée : {AGENT_LAMBDA}")
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ResourceConflictException":
+            raise
+        lam.update_function_code(FunctionName=AGENT_LAMBDA, ZipFile=code)
+        lam.get_waiter("function_updated_v2").wait(FunctionName=AGENT_LAMBDA)
+        lam.update_function_configuration(FunctionName=AGENT_LAMBDA, Environment=env, Timeout=30)
+        print(f"Lambda mise à jour : {AGENT_LAMBDA}")
+    lam.get_waiter("function_active_v2").wait(FunctionName=AGENT_LAMBDA)
+    _agent_invoke_config()
+    print("La clé d'API est dans les variables de la Lambda, pas dans le dépôt.")
+    print("Relancer 'deploy-scoring' pour que la Lambda de scoring appelle l'agent.")
+
+
+def _agent_invoke_config() -> None:
+    """Appels asynchrones de l'agent : 1 seule nouvelle tentative, puis la DLQ (si elle existe)."""
+    kwargs = {"FunctionName": AGENT_LAMBDA, "MaximumRetryAttempts": 1, "MaximumEventAgeInSeconds": 3600}
+    dlq = _queue_arn(AGENT_DLQ)
+    if dlq:
+        kwargs["DestinationConfig"] = {"OnFailure": {"Destination": dlq}}
+    session.client("lambda").put_function_event_invoke_config(**kwargs)
+
+
+def cmd_agent_test(args):
+    """Appelle l'agent une fois avec une alerte réaliste (machine 3, veille de sa panne du 4 octobre)."""
+    sys.path.insert(0, str(ROOT / "src" / "scoring"))
+    sys.path.insert(0, str(ROOT / "src" / "common"))
+    from features import FEATURE_COLUMNS, compute_features
+    from state_store import from_item
+    item = session.client("dynamodb").get_item(TableName="machine_state",
+                                               Key={"machineID": {"N": str(args.machine)}}).get("Item")
+    if not item:
+        sys.exit(f"Machine {args.machine} absente de machine_state : lancer load-machines")
+    state = from_item(item)
+    # Même charge utile que la Lambda de scoring (contrat 4), avec les 30 vraies valeurs de la machine.
+    payload = {"machineID": args.machine, "datetime": state.get("last_datetime"), "risk": 0.999,
+               "threshold": 0.948, "run_id": f"test-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}",
+               "features": dict(zip(FEATURE_COLUMNS, compute_features(state)))}
+    resp = session.client("lambda").invoke(FunctionName=AGENT_LAMBDA, Payload=json.dumps(payload).encode(),
+                                           LogType="Tail")
+    print(resp["Payload"].read().decode())
+    import base64
+    print(base64.b64decode(resp["LogResult"]).decode()[-2500:])
+
+
+# ------------------------------------------- Semaine 4 : fiabilité et alarmes
+
+def cmd_reliability(args):
+    lam = session.client("lambda")
+    scoring_dlq, agent_dlq = _queue_arn(SCORING_DLQ, create=True), _queue_arn(AGENT_DLQ, create=True)
+    print(f"DLQ prêtes : {SCORING_DLQ}, {AGENT_DLQ}")
+
+    for m in lam.list_event_source_mappings(FunctionName=SCORING_LAMBDA)["EventSourceMappings"]:
+        lam.update_event_source_mapping(UUID=m["UUID"], MaximumRetryAttempts=2, BisectBatchOnFunctionError=True,
+                                        DestinationConfig={"OnFailure": {"Destination": scoring_dlq}})
+        print("Déclencheur Kinesis -> scoring : 2 tentatives, puis DLQ")
+    try:
+        _agent_invoke_config()
+        print("Agent : 1 nouvelle tentative, puis DLQ")
+    except ClientError:
+        print("Agent pas encore déployé : relancer 'reliability' après 'deploy-agent'")
+    lam.put_function_event_invoke_config(FunctionName=SIM_LAMBDA, MaximumRetryAttempts=0)
+    print("Simulateur : aucune nouvelle tentative (le lot suivant reprend à la même position)")
+
+    topic = _topic_arn()
+    cw = session.client("cloudwatch")
+    alarms = [
+        ("smartcnc-scoring-errors", "AWS/Lambda", "Errors", "FunctionName", SCORING_LAMBDA, "Sum", 1),
+        ("smartcnc-simulator-errors", "AWS/Lambda", "Errors", "FunctionName", SIM_LAMBDA, "Sum", 1),
+        ("smartcnc-agent-errors", "AWS/Lambda", "Errors", "FunctionName", AGENT_LAMBDA, "Sum", 1),
+        # Retard de lecture : la Lambda de scoring n'arrive plus à suivre le flux (> 5 min).
+        ("smartcnc-kinesis-lag", "AWS/Kinesis", "GetRecords.IteratorAgeMilliseconds", "StreamName", STREAM,
+         "Maximum", 300_000),
+        ("smartcnc-scoring-dlq", "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", SCORING_DLQ,
+         "Maximum", 1),
+        ("smartcnc-agent-dlq", "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", AGENT_DLQ,
+         "Maximum", 1),
+    ]
+    for name, ns, metric, dim, value, stat, threshold in alarms:
+        cw.put_metric_alarm(
+            AlarmName=name, Namespace=ns, MetricName=metric, Dimensions=[{"Name": dim, "Value": value}],
+            Statistic=stat, Period=300, EvaluationPeriods=1, Threshold=threshold,
+            ComparisonOperator="GreaterThanOrEqualToThreshold", TreatMissingData="notBreaching",
+            AlarmActions=[topic], AlarmDescription=f"SmartCNC : {metric} de {value}",
+        )
+        print(f"Alarme : {name} (seuil {threshold}) -> e-mail")
+    print("Les alarmes partent sur le même sujet SNS que les alertes (objet « ALARM: … »).")
+
+
+def cmd_alarms(args):
+    resp = session.client("cloudwatch").describe_alarms(AlarmNamePrefix="smartcnc-")
+    for a in resp["MetricAlarms"]:
+        print(f"{a['AlarmName']:<28} {a['StateValue']:<18} {a.get('StateReason', '')[:70]}")
+
+
+def _delete_prefix(prefix: str) -> int:
+    s3, name, n = session.client("s3"), bucket_name(), 0
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=name, Prefix=prefix):
+        keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+        if keys:
+            s3.delete_objects(Bucket=name, Delete={"Objects": keys})
+            n += len(keys)
+    return n
+
+
+def cmd_cleanup(args):
+    """Supprime ce qui ne sert plus (rien d'utile à la démo)."""
+    ecr = session.client("ecr")
+    try:
+        old = ecr.list_images(repositoryName=SCORING_REPO, filter={"tagStatus": "UNTAGGED"})["imageIds"]
+        try:   # jamais l'image que la Lambda utilise encore (poussée mais pas redéployée)
+            used = session.client("lambda").get_function(FunctionName=SCORING_LAMBDA)["Code"].get("ResolvedImageUri", "")
+            old = [i for i in old if not used.endswith(i["imageDigest"])]
+        except ClientError:
+            pass
+        if old:
+            ecr.batch_delete_image(repositoryName=SCORING_REPO, imageIds=old)
+        print(f"ECR : {len(old)} anciennes images supprimées (seule 'latest' est gardée)")
+    except ClientError as e:
+        print("ECR :", e.response["Error"]["Code"])
+    print(f"S3 athena-results/ : {_delete_prefix('athena-results/')} fichiers supprimés")
+    print(f"S3 stream-errors/ : {_delete_prefix('stream-errors/')} fichiers supprimés")
+    if args.old_runs:
+        pages = session.client("s3").get_paginator("list_objects_v2").paginate(Bucket=bucket_name(),
+                                                                               Prefix="stream/risks/")
+        runs = sorted({o["Key"].split("/")[2] for p in pages for o in p.get("Contents", [])})
+        for run in runs[:-1]:
+            print(f"S3 stream/risks/{run}/ : {_delete_prefix(f'stream/risks/{run}/')} fichiers supprimés")
+        print(f"Rejeu gardé : {runs[-1] if runs else 'aucun'}")
+    try:
+        state = session.client("kinesis").describe_stream_summary(StreamName=STREAM)
+        print("⚠ Kinesis est encore allumé : lancer 'stream-down' en fin de séance",
+              state["StreamDescriptionSummary"]["StreamStatus"])
+    except ClientError:
+        print("Kinesis : absent ✓ (rien n'est facturé à l'heure)")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -732,11 +955,17 @@ def main():
     dep.add_argument("--replay", default="test", help="sous-dossier de replay/ (test ou full)")
     dep.add_argument("--hours", type=int, default=60, help="heures simulées par lot")
     for c in ["sim-start", "sim-stop", "sim-reset", "sim-once", "status",
-              "push-scoring", "deploy-scoring", "risks", "athena-setup", "athena-report", "athena-check", "dashboard"]:
+              "push-scoring", "deploy-scoring", "risks", "athena-setup", "athena-report", "athena-check", "dashboard",
+              "deploy-agent", "reliability", "alarms"]:
         sub.add_parser(c)
+    sub.add_parser("alerts-topic").add_argument("--email", action="append",
+                                                help="adresse à abonner (répéter l'option pour plusieurs)")
+    sub.add_parser("agent-test").add_argument("--machine", type=int, default=3)
+    sub.add_parser("cleanup").add_argument("--old-runs", action="store_true",
+                                           help="supprime aussi les risques archivés des anciens rejeux")
     sub.add_parser("upload-model").add_argument("--models", default=str(ROOT / "models"))
     lg = sub.add_parser("logs")
-    lg.add_argument("--name", choices=["scoring", "simulator"], default="scoring")
+    lg.add_argument("--name", choices=["scoring", "simulator", "agent"], default="scoring")
     lg.add_argument("--minutes", type=int, default=30)
     lg.add_argument("--lines", type=int, default=40)
     lm = sub.add_parser("load-machines")

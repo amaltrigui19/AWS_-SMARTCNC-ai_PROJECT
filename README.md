@@ -146,3 +146,41 @@ Pourquoi CloudWatch et pas QuickSight : CloudWatch est sûr d'être disponible d
 ```powershell
 .venv\Scripts\python infra/smartcnc.py athena-report      # pannes réelles annoncées ? avec combien d'heures d'avance ?
 ```
+
+## Semaine 4 : agent déployé, fiabilité, coûts
+
+### Mettre l'agent de B en service (une fois)
+
+1. Copier `.env.example` en `.env` et y mettre la clé d'API Gemini (`LLM_API_KEY`). `.env` est ignoré par Git.
+2. Lancer :
+
+```powershell
+.venv\Scripts\python infra/smartcnc.py alerts-topic --email premiere@adresse --email seconde@adresse
+# -> cliquer sur « Confirm subscription » dans chaque e-mail reçu
+.venv\Scripts\python infra/smartcnc.py deploy-agent
+.venv\Scripts\python infra/smartcnc.py deploy-scoring      # la Lambda de scoring découvre l'agent
+.venv\Scripts\python infra/smartcnc.py agent-test --machine 3
+```
+
+### Fiabilité (une fois, après deploy-agent)
+
+```powershell
+.venv\Scripts\python infra/smartcnc.py reliability         # DLQ, tentatives limitées, 6 alarmes -> e-mail
+.venv\Scripts\python infra/smartcnc.py alarms              # état des alarmes
+```
+
+| Lambda | Nouvelles tentatives | Ensuite |
+|---|---|---|
+| Simulateur | 0 | Le lot suivant reprend à la même position |
+| Scoring (déclencheur Kinesis) | 2, avec découpage du lot | Description du lot dans `smartcnc-scoring-dlq` |
+| Agent (appel asynchrone) | 1 | Alerte dans `smartcnc-agent-dlq` |
+
+Alarmes (e-mail sur le sujet `smartcnc-alerts`) : erreurs des 3 Lambdas, retard Kinesis > 5 min, message dans une des 2 DLQ.
+
+### Coûts
+
+```powershell
+.venv\Scripts\python infra/smartcnc.py cleanup             # anciennes images ECR, résultats Athena ; vérifie que Kinesis est éteint
+```
+
+Pour la démo, utiliser le rejeu **test** (10 machines, 2 semaines, environ 8 e-mails). Le rejeu complet (100 machines, 3 mois) produirait environ 400 e-mails et autant d'appels au LLM.

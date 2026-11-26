@@ -11,8 +11,15 @@ from moto import mock_aws
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src" / "simulator"))
 
-import handler  # noqa: E402
+import importlib.util  # noqa: E402
+
 import prepare_replay  # noqa: E402
+
+# Trois modules s'appellent handler.py (simulateur, scoring, agent) : on charge celui du
+# simulateur sous un nom à lui, sinon pytest peut nous donner celui d'un autre test.
+_spec = importlib.util.spec_from_file_location("simulator_handler", ROOT / "src" / "simulator" / "handler.py")
+handler = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(handler)
 
 
 @pytest.fixture
